@@ -15,7 +15,7 @@ def find_service_register_calls(pe, offset_qqnt_service, pe_image_base, max_byte
     service_registers_function = []
     prev_mov_rcx_rdi = False
     prev_mov_rdx_rsi = False
-
+    
     for insn in md.disasm(code_bytes, code_base + pe_image_base):
         # 检查retn
         if insn.mnemonic == 'ret' or insn.mnemonic == 'retn':
@@ -69,7 +69,7 @@ def read_utf8_string(pe, rva):
 def extract_service_info(pe, func_rva, image_base, max_bytes=512):
     """
     提取注册函数中的vtable_address和service_name地址
-    返回 (vtable_address, service_name)
+    返回 (vtable_address, service_name, r8d_imm)
     """
     from capstone import Cs, CS_ARCH_X86, CS_MODE_64
 
@@ -79,14 +79,13 @@ def extract_service_info(pe, func_rva, image_base, max_bytes=512):
     vtable_address = None
     service_name = None
     lea_targets = []
+    r8d_imm = None  # 新增
 
     for insn in md.disasm(code_bytes, func_rva + image_base):
         # 支持
         # lea rdx, [rip+imm]
         # lea rsi, [rip+imm]
-        # movaps  xmm0, xmmword ptr cs:off_183ABB920
         if insn.mnemonic == 'lea' and (insn.op_str.startswith('rdx, [rip + ') or insn.op_str.startswith('rsi, [rip + ')):
-            # 提取偏移
             try:
                 imm_str = insn.op_str.split('+')[1].strip(' ]')
                 imm = int(imm_str, 16) if imm_str.startswith('0x') else int(imm_str)
@@ -94,6 +93,13 @@ def extract_service_info(pe, func_rva, image_base, max_bytes=512):
                 lea_targets.append(target_addr)
             except Exception:
                 continue
+        # 新增对 mov r8d, imm32 的解析
+        if insn.mnemonic == 'mov' and insn.op_str.startswith('r8d, '):
+            try:
+                imm_str = insn.op_str.split(',')[1].strip()
+                r8d_imm = int(imm_str, 16) if imm_str.startswith('0x') else int(imm_str)
+            except Exception:
+                pass
         # 找到两个call后就可以退出
         if (insn.mnemonic == 'call' or (insn.mnemonic == 'movsq' and 'rep' in insn.prefix)):
             if len(lea_targets) >= 2:
@@ -106,7 +112,7 @@ def extract_service_info(pe, func_rva, image_base, max_bytes=512):
         vtable_address = lea_targets[0]
         service_name = None
 
-    return vtable_address, service_name
+    return vtable_address, service_name, r8d_imm
 
 def read_aligned_qword(pe, addr):
     """
@@ -190,12 +196,17 @@ if not service_registers_function:
 # 提取每个注册函数里面的off_xxxxxxxx utf8name的地址
 
 for service_register in service_registers_function:
-    vtable_address, service_name = extract_service_info(pe, service_register - pe_image_base, pe_image_base)
+    vtable_address, service_name, descriptor_size = extract_service_info(pe, service_register - pe_image_base, pe_image_base)
     if vtable_address and service_name:
         service_name_rva = service_name - pe_image_base
         service_name_str = read_utf8_string(pe, service_name_rva)
         print(f"[result] service_name: {service_name_str}")
         print(f"[result] vtable_address: {hex(vtable_address)}")
+        if descriptor_size is not None:
+            print(f"[result] descriptor_size: {hex(descriptor_size)}")
+        else:
+            descriptor_size = 16 * 8 # napi_property_descriptor properties[16];
+            print(f"[result] descriptor_size: {hex(descriptor_size)} (default)")
         # 解析方法表
         cur_addr = vtable_address - pe_image_base
         while True:
@@ -203,13 +214,15 @@ for service_register in service_registers_function:
                 function_name, next_addr = read_aligned_utf8_string(pe, cur_addr)
                 cur_addr = next_addr
                 function_addr, next_addr = read_aligned_qword(pe, cur_addr)
+                cur_addr = next_addr
                 if not function_addr:
                     break
-                if not (text_start <= function_addr-pe_image_base < text_end):
+                if not (text_start <= function_addr - pe_image_base < text_end):
+                    break
+                if descriptor_size and vtable_address + descriptor_size < cur_addr + pe_image_base:
                     break
                 if len(function_name) >1 and function_name.find('@') == -1 and function_name.find('$') == -1:
-                    print(f"Service:{service_name_str} Name: {function_name} Addr: {hex(function_addr)}")
-                cur_addr = next_addr
+                    print(f"Service: {service_name_str} Name: {function_name} Addr: {hex(function_addr)}")
             except Exception as e:
                 print(f"[error] Exception while parsing method table: {e}")
                 break
