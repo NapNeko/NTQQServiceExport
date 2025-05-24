@@ -1,7 +1,9 @@
 # NTQQServiceExport
-自动化Service函数导出工具 自动化分析
+自动化Service函数导出和拦截工具 自动化分析
 
-![演示](./readme.png)
+![演示](./readme_0.png)
+
+![演示](./readme_1.png)
 
 ## 介绍
 frida-generate.py 是自动化生成frida脚本 hook所有QQ调用
