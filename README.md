@@ -10,4 +10,4 @@ frida-generate.py 是自动化生成frida脚本 hook所有QQ调用
 
 ServiceScan.py 是演示图片上的 仅扫描功能的
 
-frida-test.py 是开发测试中的 
+frida-test.py 是仅frida hook脚本(不用每次都扫描)
