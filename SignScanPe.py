@@ -108,6 +108,36 @@ def extract_service_info(pe, func_rva, image_base, max_bytes=512):
 
     return vtable_address, service_name
 
+def read_aligned_qword(pe, addr):
+    """
+    跳过8字节对齐的0字节，读取下一个非零的8字节qword，返回(qword, next_addr)
+    如果到达区间末尾或读取失败，返回(None, addr)
+    """
+    cur_addr = addr
+    while True:
+        qword_bytes = pe.get_data(cur_addr, 8)
+        if not qword_bytes or len(qword_bytes) < 8:
+            return None, cur_addr
+        qword = int.from_bytes(qword_bytes, 'little')
+        if qword != 0:
+            return qword, cur_addr + 8
+        cur_addr += 8
+
+def read_aligned_utf8_string(pe, addr):
+    """
+    跳过8字节对齐的0字节，读取下一个非零的8字节qword作为字符串地址，读取字符串
+    返回(function_name, next_addr)。如果失败，返回(None, next_addr)
+    """
+    string_addr, next_addr = read_aligned_qword(pe, addr)
+    if not string_addr:
+        return None, next_addr
+    # 计算RVA
+    rva = string_addr - pe.OPTIONAL_HEADER.ImageBase
+    function_name = read_utf8_string(pe, rva)
+    if not function_name or function_name.strip() == "":
+        return None, next_addr
+    return function_name, next_addr
+
 pe = pefile.PE("F:\\IDA-Wrapper\\35341\\wrapper.node")
 pe_image_base = pe.OPTIONAL_HEADER.ImageBase
 
@@ -159,10 +189,27 @@ if not service_registers_function:
 # call xxxxx
 # 提取每个注册函数里面的off_xxxxxxxx utf8name的地址
 
-
 for service_register in service_registers_function:
     vtable_address, service_name = extract_service_info(pe, service_register - pe_image_base, pe_image_base)
     if vtable_address and service_name:
         service_name_rva = service_name - pe_image_base
         service_name_str = read_utf8_string(pe, service_name_rva)
         print(f"[result] service_name: {service_name_str}")
+        print(f"[result] vtable_address: {hex(vtable_address)}")
+        # 解析方法表
+        cur_addr = vtable_address - pe_image_base
+        while True:
+            try:
+                function_name, next_addr = read_aligned_utf8_string(pe, cur_addr)
+                cur_addr = next_addr
+                function_addr, next_addr = read_aligned_qword(pe, cur_addr)
+                if not function_addr:
+                    break
+                if not (text_start <= function_addr-pe_image_base < text_end):
+                    break
+                if len(function_name) >1 and function_name.find('@') == -1 and function_name.find('$') == -1:
+                    print(f"Service:{service_name_str} Name: {function_name} Addr: {hex(function_addr)}")
+                cur_addr = next_addr
+            except Exception as e:
+                print(f"[error] Exception while parsing method table: {e}")
+                break
