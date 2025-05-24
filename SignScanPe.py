@@ -53,6 +53,19 @@ def find_service_register_calls(pe, offset_qqnt_service, pe_image_base, max_byte
 
     return service_registers_function
 
+def read_utf8_string(pe, rva):
+    """
+    从给定的RVA位置读取UTF-8字符串，直到遇到0字节为止
+    """
+    string_bytes = bytearray()
+    while True:
+        byte = pe.get_data(rva, 1)
+        if not byte or byte == b'\x00':
+            break
+        string_bytes.extend(byte)
+        rva += 1
+    return string_bytes.decode('utf-8', errors='ignore')
+
 def extract_service_info(pe, func_rva, image_base, max_bytes=512):
     """
     提取注册函数中的vtable_address和service_name地址
@@ -138,7 +151,7 @@ if not service_registers_function:
     print("[result] No matching call found")
 
 # 开始解析Service注册函数
-# lea     rdx, off_xxxxxxxx 48 8D 15 E7 EB C2 02
+# lea     rdx, off_xxxxxxxx or rsi, off_xxxxxxxx
 # ...
 # call xxxx
 # lea     rdx, utf8name 48 8D 15 3D 4D 18 03
@@ -151,13 +164,5 @@ for service_register in service_registers_function:
     vtable_address, service_name = extract_service_info(pe, service_register - pe_image_base, pe_image_base)
     if vtable_address and service_name:
         service_name_rva = service_name - pe_image_base
-        # 读取 service_name_rva utf8字符串直到读到0字节
-        service_name_bytes = bytearray()
-        while True:
-            byte = pe.get_data(service_name_rva, 1)
-            if not byte or byte == b'\x00':
-                break
-            service_name_bytes.extend(byte)
-            service_name_rva += 1
-        service_name_str = service_name_bytes.decode('utf-8', errors='ignore')
+        service_name_str = read_utf8_string(pe, service_name_rva)
         print(f"[result] service_name: {service_name_str}")
