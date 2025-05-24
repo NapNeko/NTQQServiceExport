@@ -1672,9 +1672,78 @@ function hookNapiFunc(name, offset) {
 }
 
 function main() {
+    // 1. 先hook wrapper.node导出函数
     for (const [name, offset] of Object.entries(target_func_list)) {
         hookNapiFunc(name, offset);
     }
+
+    // 2. hook on*相关 napi_get_named_property 和 napi_call_function
+    // 记录所有on*函数的function指针及其名称
+    const onFunctionMap = new Map();
+
+    // hook napi_get_named_property
+    (function() {
+        const addr = Module.findExportByName('qqnt.dll', 'napi_get_named_property');
+        if (!addr) return;
+        Interceptor.attach(addr, {
+            onEnter(args) {
+                this.env = args[0];
+                this.namePtr = args[2];
+                this.resultPtr = args[3];
+                try {
+                    this.propName = Memory.readUtf8String(this.namePtr);
+                } catch {
+                    this.propName = '';
+                }
+                this.shouldLog = this.propName && this.propName.startsWith('on');
+            },
+            onLeave(retval) {
+                if (!this.shouldLog) return;
+                if (retval.toInt32() === 0) {
+                    try {
+                        const funcPtr = this.resultPtr.readPointer();
+                        if (!funcPtr.isNull()) {
+                            onFunctionMap.set(funcPtr.toString(), this.propName);
+                        }
+                    } catch {}
+                }
+            }
+        });
+    })();
+
+    // hook napi_call_function
+    (function() {
+        const addr = Module.findExportByName('qqnt.dll', 'napi_call_function');
+        if (!addr) return;
+        Interceptor.attach(addr, {
+            onEnter(args) {
+                const env = args[0];
+                const func = args[2];
+                const argc = args[3].toInt32();
+                const argv = args[4];
+
+                const funcKey = func.toString();
+                const funcName = onFunctionMap.get(funcKey);
+
+                if (funcName && funcName.startsWith('on')) {
+                    let logLines = [];
+                    logLines.push(`[on] 调用on*函数: ${funcName} @ ${func}`);
+                    logLines.push(`参数数量: ${argc}`);
+                    for (let i = 0; i < argc; i++) {
+                        try {
+                            const argPtr = argv.add(i * Process.pointerSize).readPointer();
+                            logLines.push(`[arg] 参数${i}:`);
+                            printNapiValue(env, argPtr, logLines);
+                        } catch (e) {
+                            logLines.push(`[arg] 参数${i}: <exception: ${e}>`);
+                        }
+                    }
+                    // 复用主日志格式
+                    console.log(formatLog(logLines, 'on_' + funcKey, funcName));
+                }
+            }
+        });
+    })();
 }
 
 main();

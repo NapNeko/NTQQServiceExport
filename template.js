@@ -1,4 +1,44 @@
 
+const globalNativeCallbacks = [];
+const callLogMap = new Map();
+
+function getThreadId() {
+    try {
+        return Process.getCurrentThreadId ? Process.getCurrentThreadId() : 0;
+    } catch {
+        return 0;
+    }
+}
+
+function getCallId() {
+    return `${Date.now()}_${getThreadId()}_${Math.floor(Math.random() * 100000)}`;
+}
+
+function formatLog(logLines, callId, funcName) {
+    const border = '━'.repeat(45);
+    let out = [];
+    out.push(`\n\x1b[36m┏${border}\x1b[0m`);
+    out.push(`\x1b[36m┃ 调用: ${funcName}  [${callId}]\x1b[0m`);
+    logLines.forEach(line => {
+        // 参数和返回值缩进
+        if (line.startsWith('[arg]')) {
+            out.push(`\x1b[32m┣ 参数: ${line.replace('[arg]', '').trim()}\x1b[0m`);
+        } else if (line.startsWith('[Promise]')) {
+            out.push(`\x1b[35m┣ Promise: ${line.replace('[Promise]', '').trim()}\x1b[0m`);
+        } else if (line.startsWith('---- 返回值 ----')) {
+            out.push(`\x1b[33m┣ 返回值:\x1b[0m`);
+        } else if (line.startsWith('[!]')) {
+            out.push(`\x1b[31m┣ 错误: ${line.replace('[!]', '').trim()}\x1b[0m`);
+        } else if (line.startsWith('====')) {
+            // 跳过
+        } else {
+            out.push(`\x1b[32m┣ ${line.replace('[arg]', '').trim()}\x1b[0m`);
+        }
+    });
+    out.push(`\x1b[36m┗${border}\x1b[0m\n`);
+    return out.join('\n');
+}
+
 function printNapiValue(env, value, logLines) {
     if (!value || value.isNull && value.isNull()) {
         logLines.push('[arg] value is NULL');
@@ -127,9 +167,7 @@ function isPromise(env, value) {
     }
 }
 
-const globalNativeCallbacks = [];
-
-function callPromiseThen(env, promise, logLines) {
+function callPromiseThen(env, promise, logLines, callId, funcName) {
     try {
         var napi_get_named_property = Module.findExportByName('qqnt.dll', 'napi_get_named_property');
         var napi_get_named_property_fn = new NativeFunction(napi_get_named_property, 'int', ['pointer', 'pointer', 'pointer', 'pointer']);
@@ -137,7 +175,7 @@ function callPromiseThen(env, promise, logLines) {
         var then_ptr = Memory.alloc(Process.pointerSize);
         if (napi_get_named_property_fn(env, promise, then_name, then_ptr) !== 0) {
             logLines.push('[Promise] 获取 then 方法失败');
-            console.log(logLines.join('\n'));
+            console.log(formatLog(logLines, callId, funcName));
             return;
         }
         var then_fn = then_ptr.readPointer();
@@ -162,12 +200,21 @@ function callPromiseThen(env, promise, logLines) {
                 lines.push('[Promise] resolve:');
                 printNapiValue(env_, arg_ptr, lines);
                 lines.push('==== call end ====');
-                console.log(lines.join('\n'));
+
+                // 取出主调用的logLines，合并Promise resolve内容
+                let mainLogLines = callLogMap.get(callId);
+                if (mainLogLines) {
+                    lines.forEach(l => mainLogLines.push(l));
+                    console.log(formatLog(mainLogLines, callId, funcName));
+                    callLogMap.delete(callId);
+                } else {
+                    // fallback
+                    console.log(formatLog(lines, callId, funcName));
+                }
             } catch (e) {
                 console.log('[Promise] resolve回调异常: ' + e);
             }
             if(globalNativeCallbacks.includes(onResolved)) {
-                // 3. 从全局回调列表中移除，防止内存泄漏
                 var index = globalNativeCallbacks.indexOf(onResolved);
                 if (index !== -1) {
                     globalNativeCallbacks.splice(index, 1);
@@ -184,7 +231,7 @@ function callPromiseThen(env, promise, logLines) {
         if (status !== 0) {
             logLines.push('[Promise] 创建回调函数失败: ' + status);
             logLines.push('==== call end ====');
-            console.log(logLines.join('\n'));
+            console.log(formatLog(logLines, callId, funcName));
             return;
         }
 
@@ -197,12 +244,12 @@ function callPromiseThen(env, promise, logLines) {
         if (callStatus !== 0) {
             logLines.push('[Promise] then调用失败: ' + callStatus);
             logLines.push('==== call end ====');
-            console.log(logLines.join('\n'));
+            console.log(formatLog(logLines, callId, funcName));
         }
     } catch (e) {
         logLines.push('[Promise] then 调用异常: ' + e);
         logLines.push('==== call end ====');
-        console.log(logLines.join('\n'));
+        console.log(formatLog(logLines, callId, funcName));
     }
 }
 
@@ -215,8 +262,9 @@ function hookNapiFunc(name, offset) {
     var funcAddr = baseAddr.add(offset);
     Interceptor.attach(funcAddr, {
         onEnter: function (args) {
+            this.callId = getCallId();
+            this.funcName = name;
             this.logLines = [];
-            this.logLines.push(`==== ${name} call ====`);
             var env = args[0], info = args[1];
             this.env = env; // 保存env用于onLeave
             var napi_get_cb_info = Module.findExportByName('qqnt.dll', 'napi_get_cb_info');
@@ -225,49 +273,117 @@ function hookNapiFunc(name, offset) {
             var argv_ptr = Memory.alloc(Process.pointerSize * 8);
             var status = napi_get_cb_info_fn(env, info, argc_ptr, argv_ptr, ptr(0), ptr(0));
             if (status !== 0) {
-                this.logLines.push(`[${name}] napi_get_cb_info failed: ` + status);
-                console.log(this.logLines.join('\n'));
+                this.logLines.push(`[!] napi_get_cb_info failed: ` + status);
+                callLogMap.set(this.callId, this.logLines);
                 return;
             }
             var argc = argc_ptr.readU64();
-            this.logLines.push(`Function: ${name} Argc: ` + argc);
+            this.logLines.push(`参数量: ` + argc);
             for (var i = 0; i < argc; i++) {
                 var arg_ptr = argv_ptr.add(i * Process.pointerSize).readPointer();
                 printNapiValue(env, arg_ptr, this.logLines);
             }
+            callLogMap.set(this.callId, this.logLines);
         },
         onLeave: function (retval) {
-            this.logLines.push('---- 返回值 ----');
+            let logLines = callLogMap.get(this.callId) || [];
+            logLines.push('---- 返回值 ----');
             try {
-                // 判空
                 if (retval.isNull() || retval.isZero && retval.isZero()) {
-                    this.logLines.push('[!] 返回值为 NULL 或 0，无法序列化');
-                    this.logLines.push(`==== call end ====`);
-                    console.log(this.logLines.join('\n'));
+                    logLines.push(`空返回`);
+                    console.log(formatLog(logLines, this.callId, this.funcName));
+                    callLogMap.delete(this.callId);
                 } else {
                     if (isPromise(this.env, retval)) {
-                        this.logLines.push('[Promise] 返回值为Promise，等待resolve...');
-                        callPromiseThen(this.env, retval, this.logLines);
+                        // 不立即输出，等Promise resolve后输出
+                        callPromiseThen(this.env, retval, logLines, this.callId, this.funcName);
                     } else {
-                        printNapiValue(this.env, retval, this.logLines);
-                        this.logLines.push(`==== call end ====`);
-                        console.log(this.logLines.join('\n'));
+                        printNapiValue(this.env, retval, logLines);
+                        console.log(formatLog(logLines, this.callId, this.funcName));
+                        callLogMap.delete(this.callId);
                     }
                 }
-
             } catch (e) {
-                this.logLines.push('[!] 返回值序列化异常: ' + e);
-                this.logLines.push(`==== call end ====`);
-                console.log(this.logLines.join('\n'));
+                logLines.push('[!] 返回值序列化异常: ' + e);
+                console.log(formatLog(logLines, this.callId, this.funcName));
+                callLogMap.delete(this.callId);
             }
         }
     });
 }
 
 function main() {
+    // 1. 先hook wrapper.node导出函数
     for (const [name, offset] of Object.entries(target_func_list)) {
         hookNapiFunc(name, offset);
     }
+
+    // 2. hook on*相关 napi_get_named_property 和 napi_call_function
+    // 记录所有on*函数的function指针及其名称
+    const onFunctionMap = new Map();
+
+    // hook napi_get_named_property
+    (function() {
+        const addr = Module.findExportByName('qqnt.dll', 'napi_get_named_property');
+        if (!addr) return;
+        Interceptor.attach(addr, {
+            onEnter(args) {
+                this.env = args[0];
+                this.namePtr = args[2];
+                this.resultPtr = args[3];
+                try {
+                    this.propName = Memory.readUtf8String(this.namePtr);
+                } catch {
+                    this.propName = '';
+                }
+                this.shouldLog = this.propName && this.propName.startsWith('on');
+            },
+            onLeave(retval) {
+                if (!this.shouldLog) return;
+                if (retval.toInt32() === 0) {
+                    try {
+                        const funcPtr = this.resultPtr.readPointer();
+                        if (!funcPtr.isNull()) {
+                            onFunctionMap.set(funcPtr.toString(), this.propName);
+                        }
+                    } catch {}
+                }
+            }
+        });
+    })();
+
+    // hook napi_call_function
+    (function() {
+        const addr = Module.findExportByName('qqnt.dll', 'napi_call_function');
+        if (!addr) return;
+        Interceptor.attach(addr, {
+            onEnter(args) {
+                const env = args[0];
+                const func = args[2];
+                const argc = args[3].toInt32();
+                const argv = args[4];
+
+                const funcKey = func.toString();
+                const funcName = onFunctionMap.get(funcKey);
+
+                if (funcName && funcName.startsWith('on')) {
+                    let logLines = [];
+                    logLines.push(`[on] 调用on*函数: ${funcName} @ ${func}`);
+                    logLines.push(`参数数量: ${argc}`);
+                    for (let i = 0; i < argc; i++) {
+                        try {
+                            const argPtr = argv.add(i * Process.pointerSize).readPointer();
+                            logLines.push(`[arg] 参数${i}:`);
+                            printNapiValue(env, argPtr, logLines);
+                        } catch (e) {
+                            logLines.push(`[arg] 参数${i}: <exception: ${e}>`);
+                        }
+                    }
+                    console.log(formatLog(logLines, 'on_' + funcKey, funcName));
+                }
+            }
+        });
+    })();
 }
 
 main();
